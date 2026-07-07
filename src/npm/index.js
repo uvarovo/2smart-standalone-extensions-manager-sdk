@@ -1,16 +1,13 @@
 // native modules
 const path     = require('path');
 const Debugger = require('homie-sdk/lib/utils/debugger');
-const semverLt = require('semver/functions/lt');
 
 const { EXTENSIONS, COMMON } = require('../errorCodes');
-const STATUS_CODES           = require('../statusCodes');
 const { npm }                = require('../../etc/config');
 const {
     exec,
     exists,
     X,
-    opendir,
     readfile
 } = require('../utils');
 
@@ -55,22 +52,62 @@ class NPM extends ExtensionsManager {
 
     async searchExtensions(text, options) {
         const { keywords } = options;
+        const lowerText = (text || '').toLowerCase();
+        const results = [];
+        const fsPromises = require('fs').promises;
 
-        const keywordSearchQualifier = (keywords && keywords.length) ? `+keywords:${keywords.join('+')}` : '';
+        for (const type of this.extensionTypes) {
+            const dirPath = path.join(this.installPath, type, 'node_modules');
 
-        try {
-            // search qualifiers must be right after the "text" query param,
-            // in another way it will not find modules by keywords correctly
-            const response = await fetch(`${this.searchURL}?text=${text}${keywordSearchQualifier}`);
-            const searchResults = await response.json();
+            try {
+                const entries = await fsPromises.readdir(dirPath, { withFileTypes: true });
 
-            return searchResults.objects;
-        } catch (err) {
-            throw new X({
-                code   : COMMON.TIMEOUT,
-                fields : {}
-            });
+                for (const entry of entries) {
+                    if (!entry.isDirectory()) continue;
+
+                    const pkgNames = [];
+
+                    if (entry.name.startsWith('@')) {
+                        const scopedPath = path.join(dirPath, entry.name);
+                        try {
+                            const sub = await fsPromises.readdir(scopedPath, { withFileTypes: true });
+                            for (const s of sub) {
+                                if (s.isDirectory()) pkgNames.push(`${entry.name}/${s.name}`);
+                            }
+                        } catch (e) { /* ignore */ }
+                    } else {
+                        pkgNames.push(entry.name);
+                    }
+
+                    for (const pkgName of pkgNames) {
+                        try {
+                            const pkgPath = path.join(dirPath, pkgName, 'package.json');
+                            const pkg = JSON.parse(await fsPromises.readFile(pkgPath, 'utf-8'));
+
+                            if (!pkg.keywords || !pkg.keywords.includes(type)) continue;
+
+                            const nameMatch = !lowerText || pkg.name.toLowerCase().includes(lowerText);
+                            const kwMatch = !keywords || !keywords.length ||
+                                keywords.every(kw => pkg.keywords.includes(kw));
+
+                            if (nameMatch && kwMatch) {
+                                results.push({
+                                    package : {
+                                        name        : pkg.name,
+                                        version     : pkg.version,
+                                        description : pkg.description || '',
+                                        keywords    : pkg.keywords || [],
+                                        links       : { npm : '' }
+                                    }
+                                });
+                            }
+                        } catch (e) { /* ignore */ }
+                    }
+                }
+            } catch (e) { /* ignore if dir doesn't exist */ }
         }
+
+        return results;
     }
 
     async getExtensionTypeByExtensionName(extensionName) {
@@ -107,29 +144,18 @@ class NPM extends ExtensionsManager {
         return isInstalled;
     }
 
-    async searchExtensionByName(extensionName, version = 'latest') {
-        let response;
+    async searchExtensionByName(extensionName) {
+        for (const type of this.extensionTypes) {
+            const pkgPath = path.join(this.installPath, type, 'node_modules', extensionName, 'package.json');
 
-        try {
-            response = await fetch(`${this.searchByPackageNameURL}${this.prepareExtensionName(extensionName)}/${version}`);
-        } catch (err) {
-            this.debug.warning('NPM.searchExtensionByName', err);
-
-            throw new X({
-                code   : COMMON.TIMEOUT,
-                fields : {}
-            });
+            if (await exists(pkgPath)) {
+                try {
+                    return JSON.parse(await readfile(pkgPath, 'utf-8'));
+                } catch (e) { /* ignore */ }
+            }
         }
 
-        if (response.status !== STATUS_CODES.OK) {
-            this.debug.warning('NPM.searchExtensionByName', { responseStatus: response.status, responseStatusText: response.statusText, responseUrl: response.url });
-
-            return null;
-        }
-
-        const extension = await response.json();
-
-        return extension;
+        return null;
     }
 
     async getExtensionInstallPath(extensionName, extensionType) {
@@ -213,26 +239,9 @@ class NPM extends ExtensionsManager {
         }
     }
 
-    async hasAvailableUpdate(extensionName, extensionType) {
-        try {
-            const packageConfigObj = await this.getExtensionConfigObj(extensionName, extensionType);
-            const npmPackageInfo = await this.searchExtensionByName(extensionName);
-
-            if (!npmPackageInfo || !npmPackageInfo.version) {
-                throw new X({ code: EXTENSIONS.UNSUPPORTED_PACKAGE, fields: {} });
-            }
-
-            const latestVersion = npmPackageInfo.version;
-            const installedVersion = packageConfigObj.version;
-
-            return semverLt(installedVersion, latestVersion); // .lt - less than
-        } catch (err) {
-            this.debug.warning('NPM.hasAvailableUpdate', err);
-            throw new X({
-                code   : EXTENSIONS.CHECK_UPDATES_ERROR,
-                fields : {}
-            });
-        }
+    async hasAvailableUpdate() {
+        // Fully local — no remote registry, updates are managed manually
+        return false;
     }
 
     /**
@@ -243,7 +252,8 @@ class NPM extends ExtensionsManager {
     }
 
     getExtensionInfoURL(extensionName) {
-        return `${this.packageURL}/${this.prepareExtensionName(extensionName)}`;
+        // homie entity requires a non-empty link; use a local placeholder
+        return `https://github.com/search?q=${this.prepareExtensionName(extensionName)}`;
     }
 
     async getExtensionConfigObj(extensionName, extensionType = '') {
@@ -302,6 +312,7 @@ class NPM extends ExtensionsManager {
     async getInstalledExtensions() {
         const packageConfigObjs = [];
         const packageNames = [];
+        const fsPromises = require('fs').promises;
 
         try {
             for (const type of this.extensionTypes) {
@@ -310,23 +321,25 @@ class NPM extends ExtensionsManager {
                 // eslint-disable-next-line no-sync
                 if (!(await exists(dirPath))) continue;
 
-                const dir = await opendir(dirPath);
+                const entries = await fsPromises.readdir(dirPath, { withFileTypes: true });
 
-                for await (const dirent of dir) {
-                    if (dirent.isDirectory()) {
-                        if (dirent.name.startsWith('@')) {
-                            const scopedDirPath = path.join(dirPath, dirent.name);
+                for (const entry of entries) {
+                    if (!entry.isDirectory()) continue;
 
-                            for await (const scopedDirent of await opendir(scopedDirPath)) {
-                                const scopedPackageName = `${dirent.name}/${scopedDirent.name}`;
-                                packageNames.push(scopedPackageName);
+                    if (entry.name.startsWith('@')) {
+                        const scopedPath = path.join(dirPath, entry.name);
+                        try {
+                            const scopedEntries = await fsPromises.readdir(scopedPath, { withFileTypes: true });
+                            for (const scopedEntry of scopedEntries) {
+                                if (scopedEntry.isDirectory()) {
+                                    packageNames.push(`${entry.name}/${scopedEntry.name}`);
+                                }
                             }
-
-                            continue;
-                        }
-
-                        packageNames.push(dirent.name);
+                        } catch (e) { /* ignore */ }
+                        continue;
                     }
+
+                    packageNames.push(entry.name);
                 }
 
                 for (const packageName of packageNames) {

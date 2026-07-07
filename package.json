@@ -1,7 +1,7 @@
 {
   "name": "extensions-manager-sdk",
-  "version": "1.0.0",
-  "description": "SDK for managing extensions",
+  "version": "1.0.1-local",
+  "description": "SDK for managing extensions (local-only fork for 2Smart standalone deployments)",
   "main": "ExtensionsManager.js",
   "scripts": {
     "test": "echo \"Error: no test specified\" && exit 1",
@@ -9,7 +9,7 @@
   },
   "repository": {
     "type": "git",
-    "url": "git+ssh://git@github.com/2SmartCloud/2smart-standalone-extensions-manager-sdk.git"
+    "url": "git+ssh://git@github.com/uvarovo/2smart-standalone-extensions-manager-sdk.git"
   },
   "author": "WebbyLab",
   "license": "SEE LICENSE IN LICENSE.txt",
